@@ -151,6 +151,40 @@ kill_all_telegram_orphans() {
   echo "$pids"
 }
 
+# Find orphaned telegram bun processes from OTHER Claude sessions
+# These are bun server.ts processes whose parent Claude session has exited (PPID=1)
+find_external_orphans() {
+  # Orphaned bun server.ts processes
+  pgrep -f "bun.*server\.ts" 2>/dev/null | while read -r pid; do
+    local ppid
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
+    [[ "$ppid" != "1" ]] && continue
+    if lsof -p "$pid" -Fn 2>/dev/null | grep -q "telegram"; then
+      echo "$pid"
+    fi
+  done
+
+  # Orphaned "bun run --cwd ...telegram..." parent processes
+  pgrep -f "bun run.*telegram.*start" 2>/dev/null | while read -r pid; do
+    local ppid
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
+    [[ "$ppid" != "1" ]] && continue
+    echo "$pid"
+  done
+}
+
+# Periodically sweep orphaned telegram bun processes from other Claude sessions
+sweep_external_orphans() {
+  local orphans
+  orphans=$(find_external_orphans | sort -u)
+  if [[ -n "$orphans" ]]; then
+    local count
+    count=$(echo "$orphans" | wc -l | tr -d ' ')
+    log "SWEEP: found ${count} external orphan(s), killing: $(echo $orphans | tr '\n' ' ')"
+    echo "$orphans" | xargs kill -9 2>/dev/null || true
+  fi
+}
+
 kill_claude_and_children() {
   local claude_pid="$1"
 
@@ -317,10 +351,18 @@ main() {
     log "Claude Code started, entering health check loop"
 
     local failure_count=0
+    local sweep_counter=0
+    local SWEEP_INTERVAL=5  # sweep every 5 health checks (~5 min)
 
     while kill -0 "$claude_pid" 2>/dev/null; do
       sleep "$CHECK_INTERVAL"
       rotate_log
+
+      # Periodically sweep orphaned telegram bun processes from other sessions
+      sweep_counter=$((sweep_counter + 1))
+      if [[ $((sweep_counter % SWEEP_INTERVAL)) -eq 0 ]]; then
+        sweep_external_orphans
+      fi
 
       local health_result=0
       check_health "$token" "$claude_pid" || health_result=$?
