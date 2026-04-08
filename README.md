@@ -2,7 +2,7 @@
 
 Keepalive daemon for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) + [Telegram channel plugin](https://github.com/anthropics/claude-code/tree/main/packages/claude-code-plugins).
 
-Monitors the Claude Code process and Telegram Bot API health, automatically restarts on failure, and cleans up orphan processes. Optionally runs as a macOS launchd service for boot-time auto-start.
+Monitors the Claude Code process and Telegram Bot API health, automatically restarts on failure, and cleans up orphan processes. Includes an **orphan sweeper** that periodically kills leaked bun processes from any Claude Code plugin. Optionally runs as a macOS launchd service for boot-time auto-start.
 
 ## How it works
 
@@ -44,10 +44,22 @@ bash install.sh
 
 ## Usage
 
+### Watchdog
+
 ```bash
 bash watchdog.sh              # run in foreground
 bash watchdog.sh status       # show status
 bash watchdog.sh stop         # stop running instance
+```
+
+### Orphan sweeper
+
+Scans for leaked bun processes from **all** Claude Code plugins (not just telegram) and kills them. Runs automatically via launchd every 120 seconds after `install.sh`.
+
+```bash
+bash orphan-sweeper.sh              # single sweep (kill orphans)
+bash orphan-sweeper.sh status       # show orphans without killing
+bash orphan-sweeper.sh dry-run      # report what would be killed
 ```
 
 ### launchd (auto-start on login)
@@ -88,11 +100,13 @@ Copy `.env.example` to `.env`. Only `WORK_DIR` is required — everything else h
 
 ```
 ├── watchdog.sh          # Core daemon — health check + restart loop
+├── orphan-sweeper.sh    # Periodic cleanup of orphan bun processes from all plugins
 ├── launchd-wrapper.sh   # launchd → tmux bridge
-├── install.sh           # Install/uninstall launchd service
+├── install.sh           # Install/uninstall launchd services (watchdog + sweeper)
 ├── .env.example         # Configuration template
 └── logs/                # Runtime logs (gitignored)
     ├── watchdog.log
+    ├── orphan-sweeper.log
     └── launchd.log
 ```
 
