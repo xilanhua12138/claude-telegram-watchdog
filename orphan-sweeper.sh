@@ -58,7 +58,7 @@ rotate_log() {
 # Get cwd of a single process (precise extraction)
 get_cwd() {
   local pid=$1
-  lsof -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}'
+  lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}'
 }
 
 # Get all active claude process PIDs
