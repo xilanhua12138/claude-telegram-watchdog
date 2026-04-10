@@ -16,8 +16,13 @@ WATCHDOG="$SCRIPT_DIR/watchdog.sh"
 
 # If session already exists, watchdog is still running
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] tmux session '$SESSION' already exists, skipping"
-  exit 0
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] tmux session '$SESSION' already exists, waiting for it to end"
+  # Block until existing session ends, then exit 1 so launchd restarts us
+  while tmux has-session -t "$SESSION" 2>/dev/null; do
+    sleep 10
+  done
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] existing tmux session '$SESSION' ended"
+  exit 1
 fi
 
 # Create detached tmux session running the watchdog

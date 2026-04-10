@@ -28,10 +28,16 @@ cd claude-telegram-watchdog
 cp .env.example .env
 # Edit .env — set WORK_DIR at minimum
 
-# 2. Run (foreground, good for testing)
+# 2. One-command start (recommended)
+bash start.sh                 # start watchdog in tmux + sweep orphans
+bash start.sh status          # check status
+bash start.sh stop            # stop everything
+bash start.sh restart         # restart
+
+# 3. Or run in foreground (good for debugging)
 bash watchdog.sh
 
-# 3. Or install as launchd service (auto-start on boot)
+# 4. Or install as launchd service (auto-start on boot)
 bash install.sh
 ```
 
@@ -99,9 +105,10 @@ Copy `.env.example` to `.env`. Only `WORK_DIR` is required — everything else h
 ## Files
 
 ```
+├── start.sh             # One-command start/stop/restart/status
 ├── watchdog.sh          # Core daemon — health check + restart loop
 ├── orphan-sweeper.sh    # Periodic cleanup of orphan bun processes from all plugins
-├── launchd-wrapper.sh   # launchd → tmux bridge
+├── launchd-wrapper.sh   # launchd → tmux bridge (blocks until session ends)
 ├── install.sh           # Install/uninstall launchd services (watchdog + sweeper)
 ├── .env.example         # Configuration template
 └── logs/                # Runtime logs (gitignored)
