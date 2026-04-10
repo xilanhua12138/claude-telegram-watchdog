@@ -58,10 +58,17 @@ fi
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT:-50}"
 
 # ── Utilities ────────────────────────────────────────
+# After claude starts, QUIET=1 suppresses stdout so log output
+# doesn't leak into claude's TUI prompt as fake user input.
+QUIET=0
 log() {
   local ts
   ts=$(date '+%Y-%m-%d %H:%M:%S')
-  echo "[$ts] $*" | tee -a "$LOG_FILE"
+  if [[ "$QUIET" -eq 1 ]]; then
+    echo "[$ts] $*" >> "$LOG_FILE"
+  else
+    echo "[$ts] $*" | tee -a "$LOG_FILE"
+  fi
 }
 
 rotate_log() {
@@ -339,6 +346,8 @@ main() {
 
     log "Waiting 20s for MCP server startup..."
     sleep 20
+    # Suppress stdout so log output doesn't leak into claude's TUI as input
+    QUIET=1
 
     if ! kill -0 "$claude_pid" 2>/dev/null; then
       log "ERROR: Claude Code failed to start"
@@ -383,6 +392,7 @@ main() {
       if [[ $failure_count -ge $MAX_FAILURES ]]; then
         log "=== Restarting (${failure_count} consecutive failures) ==="
         kill_claude_and_children "$claude_pid"
+        QUIET=0
         log "Restarting in ${RESTART_DELAY}s..."
         sleep "$RESTART_DELAY"
         token=$(read_bot_token) || { log "FATAL: cannot read bot token"; exit 1; }
@@ -393,6 +403,7 @@ main() {
     if [[ $failure_count -lt $MAX_FAILURES ]]; then
       local exit_code=0
       wait "$claude_pid" 2>/dev/null || exit_code=$?
+      QUIET=0
       log "Claude Code exited (code: $exit_code)"
       kill_claude_and_children "$claude_pid"
       log "Restarting in ${RESTART_DELAY}s..."
