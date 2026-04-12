@@ -1,13 +1,20 @@
 #!/bin/bash
 #
-# orphan-sweeper.sh — Kill orphaned bun processes from Claude Code plugins
+# orphan-sweeper.sh — Kill stale bun processes from Claude Code plugins
 #
-# Problem: Each Claude Code session spawns MCP server child processes (bun server.ts, etc).
-#          When a session exits abnormally, these children become orphans (PPID=1) and eat CPU.
-#          The watchdog only cleans up telegram-related orphans; other plugins are missed.
+# Two kinds of staleness are handled:
 #
-# Solution: Scan all PPID=1 bun processes, check if they belong to .claude/plugins/,
-#           verify they're not owned by any active Claude session, then kill them.
+#   1. ORPHANS — PPID=1 bun processes (or their direct children) whose parent
+#      Claude session is gone. These leak after abnormal session exits.
+#
+#   2. VERSION MISMATCH — bun processes pinned to a plugin version (via
+#      `--cwd .../cache/<marketplace>/<plugin>/<version>`) that no longer
+#      matches the installed version in installed_plugins.json. These
+#      happen after `claude plugin update`: old bun keeps running under a
+#      live shell, new sessions launch the new version, and both end up
+#      polling the same external API (e.g. Telegram bot token → 409 Conflict).
+#      Version-aware cleanup catches this case even when the process has
+#      a live parent (so plain orphan detection would miss it).
 #
 # Usage:
 #   bash orphan-sweeper.sh              # single sweep
@@ -35,6 +42,9 @@ load_env
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 LOG_FILE="${LOG_DIR}/orphan-sweeper.log"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"  # 2MB
+INSTALLED_PLUGINS_JSON="${INSTALLED_PLUGINS_JSON:-$HOME/.claude/plugins/installed_plugins.json}"
+# Set SKIP_VERSION_CHECK=1 to disable the version-mismatch sweep
+SKIP_VERSION_CHECK="${SKIP_VERSION_CHECK:-0}"
 DRY_RUN=false
 
 # ── Utilities ────────────────────────────────────────
@@ -107,6 +117,86 @@ is_claude_plugin_bun() {
   return 1
 }
 
+# ── Version-mismatch detection ───────────────────────
+# Map plugin cache path → currently installed version, emitted as
+# "<marketplace>/<plugin> <version>" lines. Returns empty if the
+# manifest is missing/unreadable or python3 is unavailable.
+read_installed_plugin_versions() {
+  [[ -f "$INSTALLED_PLUGINS_JSON" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  python3 - "$INSTALLED_PLUGINS_JSON" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+for key, entries in (data.get("plugins") or {}).items():
+    # key format: "<plugin-name>@<marketplace>"
+    if "@" not in key:
+        continue
+    plugin, marketplace = key.split("@", 1)
+    for entry in entries or []:
+        version = entry.get("version")
+        if not version or version == "unknown":
+            continue
+        print(f"{marketplace}/{plugin} {version}")
+PY
+}
+
+# Extract marketplace, plugin name, and version from a bun command line
+# that pins a plugin via `--cwd .../cache/<marketplace>/<plugin>/<version>`.
+# Emits "marketplace|plugin|version" or nothing.
+extract_plugin_version() {
+  local args=$1
+  # Use `#` as sed delimiter so `|` can be used as field separator
+  # shellcheck disable=SC2001
+  echo "$args" | sed -n 's#.*\.claude/plugins/cache/\([^/]*\)/\([^/]*\)/\([^/ ]*\).*#\1|\2|\3#p'
+}
+
+# Find bun processes whose pinned plugin version differs from the currently
+# installed version. Outputs "pid|stale-version|cwd|args" for each stale proc.
+find_stale_version_buns() {
+  [[ "$SKIP_VERSION_CHECK" == "1" ]] && return 0
+
+  local installed
+  installed=$(read_installed_plugin_versions)
+  [[ -z "$installed" ]] && return 0
+
+  # Match only actual bun executables
+  local bun_pids
+  bun_pids=$(ps -eo pid,comm= 2>/dev/null | awk '$2 ~ /^(bun|\/.*\/bun)$/' | awk '{print $1}')
+  [[ -z "$bun_pids" ]] && return 0
+
+  echo "$bun_pids" | while read -r pid; do
+    [[ -z "$pid" ]] && continue
+    local args
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+    [[ -z "$args" ]] && continue
+
+    local triple
+    triple=$(extract_plugin_version "$args")
+    [[ -z "$triple" ]] && continue
+
+    local marketplace plugin proc_version
+    IFS='|' read -r marketplace plugin proc_version <<< "$triple"
+    [[ -z "$marketplace" || -z "$plugin" || -z "$proc_version" ]] && continue
+
+    local installed_version
+    installed_version=$(echo "$installed" \
+      | awk -v k="${marketplace}/${plugin}" '$1==k {print $2; exit}')
+    [[ -z "$installed_version" ]] && continue
+
+    if [[ "$proc_version" != "$installed_version" ]]; then
+      local cwd
+      cwd=$(get_cwd "$pid")
+      echo "$pid|stale-version:${marketplace}/${plugin}@${proc_version}→${installed_version}|${cwd:-unknown}|$args"
+    fi
+  done | sort -u
+}
+
 # ── Core: find orphan bun processes ──────────────────
 find_orphan_buns() {
   local claude_pids
@@ -163,31 +253,37 @@ find_orphan_buns() {
 
 # ── Sweep ────────────────────────────────────────────
 sweep() {
-  local orphans
+  local orphans stale
   orphans=$(find_orphan_buns)
+  stale=$(find_stale_version_buns)
 
-  [[ -z "$orphans" ]] && return 0
+  # Merge both sources, dedupe by PID (first field), preserve order of input
+  local combined
+  combined=$(printf '%s\n%s\n' "$orphans" "$stale" \
+    | awk -F'\\|' 'NF>=2 && !seen[$1]++')
+
+  [[ -z "$combined" ]] && return 0
 
   local count
-  count=$(echo "$orphans" | wc -l | tr -d ' ')
+  count=$(echo "$combined" | wc -l | tr -d ' ')
 
   if $DRY_RUN; then
-    log "DRY-RUN: found ${count} orphan bun process(es):"
-    echo "$orphans" | while IFS='|' read -r pid type cwd args; do
+    log "DRY-RUN: found ${count} stale bun process(es):"
+    echo "$combined" | while IFS='|' read -r pid type cwd args; do
       log "  PID=$pid type=$type cmd=${args:0:80}"
       echo "  PID=$pid type=$type cwd=$cwd cmd=${args:0:80}"
     done
     return 0
   fi
 
-  log "SWEEP: found ${count} orphan bun process(es), killing"
-  echo "$orphans" | while IFS='|' read -r pid type cwd args; do
+  log "SWEEP: found ${count} stale bun process(es), killing"
+  echo "$combined" | while IFS='|' read -r pid type cwd args; do
     log "  KILL PID=$pid type=$type cmd=${args:0:80}"
     kill -9 "$pid" 2>/dev/null || true
   done
 
   sleep 1
-  log "SWEEP: done, cleaned ${count} orphan(s)"
+  log "SWEEP: done, cleaned ${count} process(es)"
 }
 
 # ── Status ───────────────────────────────────────────
@@ -195,20 +291,23 @@ cmd_status() {
   echo "=== Claude Plugin Orphan Sweeper ==="
   echo ""
 
-  local orphans
+  local orphans stale combined
   orphans=$(find_orphan_buns)
+  stale=$(find_stale_version_buns)
+  combined=$(printf '%s\n%s\n' "$orphans" "$stale" \
+    | awk -F'\\|' 'NF>=2 && !seen[$1]++')
 
-  if [[ -z "$orphans" ]]; then
-    echo "No orphan bun processes found."
+  if [[ -z "$combined" ]]; then
+    echo "No stale bun processes found."
   else
     local count
-    count=$(echo "$orphans" | wc -l | tr -d ' ')
-    echo "Found ${count} orphan bun process(es):"
+    count=$(echo "$combined" | wc -l | tr -d ' ')
+    echo "Found ${count} stale bun process(es):"
     echo ""
-    printf "%-8s %-15s %-50s %s\n" "PID" "TYPE" "CWD" "CMD"
-    printf "%-8s %-15s %-50s %s\n" "---" "----" "---" "---"
-    echo "$orphans" | while IFS='|' read -r pid type cwd args; do
-      printf "%-8s %-15s %-50s %s\n" "$pid" "$type" "${cwd:0:50}" "${args:0:60}"
+    printf "%-8s %-40s %-50s %s\n" "PID" "TYPE" "CWD" "CMD"
+    printf "%-8s %-40s %-50s %s\n" "---" "----" "---" "---"
+    echo "$combined" | while IFS='|' read -r pid type cwd args; do
+      printf "%-8s %-40s %-50s %s\n" "$pid" "${type:0:40}" "${cwd:0:50}" "${args:0:60}"
     done
   fi
 
