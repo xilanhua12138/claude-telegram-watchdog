@@ -166,13 +166,34 @@ find_external_orphans() {
     local ppid
     ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
     [[ "$ppid" != "1" ]] && continue
+
+    # Primary: lsof shows telegram-related open files
     if lsof -p "$pid" -Fn 2>/dev/null | grep -q "telegram"; then
       echo "$pid"
+      continue
+    fi
+
+    # Fallback: CWD is under .claude/plugins/ (covers long-running orphans
+    # whose file descriptors are closed and lsof no longer shows telegram)
+    local cwd
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
+    if [[ "$cwd" == *".claude/plugins/"* ]]; then
+      echo "$pid"
+      continue
     fi
   done
 
   # Orphaned "bun run --cwd ...telegram..." parent processes
   pgrep -f "bun run.*telegram.*start" 2>/dev/null | while read -r pid; do
+    local ppid
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
+    [[ "$ppid" != "1" ]] && continue
+    echo "$pid"
+  done
+
+  # Fallback: orphaned "bun run --cwd .../.claude/plugins/..." processes
+  # (version-mismatched or leaked plugin runners that don't mention "telegram")
+  pgrep -f "bun run.*\.claude/plugins/" 2>/dev/null | while read -r pid; do
     local ppid
     ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
     [[ "$ppid" != "1" ]] && continue
@@ -219,6 +240,29 @@ kill_claude_and_children() {
 }
 
 # ── Health check ─────────────────────────────────────
+# True if $1 is a descendant of $2 in the process tree
+is_descendant_of() {
+  local pid="$1" ancestor="$2"
+  local cur="$pid"
+  local depth=0
+  while [[ -n "$cur" && "$cur" != "1" && "$cur" != "$ancestor" && $depth -lt 20 ]]; do
+    cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+    depth=$((depth + 1))
+  done
+  [[ "$cur" == "$ancestor" ]]
+}
+
+# True if a telegram MCP bun server.ts is running under claude_pid's tree
+mcp_subprocess_alive() {
+  local claude_pid="$1"
+  local bun_pids
+  bun_pids=$(pgrep -f "bun.*server\.ts" 2>/dev/null) || true
+  for p in $bun_pids; do
+    is_descendant_of "$p" "$claude_pid" && return 0
+  done
+  return 1
+}
+
 check_health() {
   local token="$1"
   local claude_pid="$2"
@@ -235,7 +279,14 @@ check_health() {
     return 2
   fi
 
-  # Check 3: Bot API getMe
+  # Check 3: MCP bun server.ts alive under claude's tree
+  # Covers the "MCP disconnected inside session" case that checks 1/2/4 all miss.
+  if ! mcp_subprocess_alive "$claude_pid"; then
+    log "HEALTH: MCP bun server.ts not found under claude tree (MCP disconnected)"
+    return 1
+  fi
+
+  # Check 4: Bot API getMe
   local response http_code
   response=$(curl -s -m 15 -w "\n%{http_code}" "https://api.telegram.org/bot${token}/getMe" 2>&1) || true
   http_code=$(echo "$response" | tail -1)

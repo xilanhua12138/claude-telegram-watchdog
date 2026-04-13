@@ -114,6 +114,15 @@ is_claude_plugin_bun() {
     return 0
   fi
 
+  # Fallback: orphan bun server.ts with no recoverable CWD info
+  # bun server.ts is the MCP server entrypoint for Claude plugins;
+  # if PPID=1 and we can't confirm otherwise, treat as plugin process.
+  local ppid
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  if [[ "$ppid" == "1" ]] && [[ "$args" == *"bun server.ts"* || "$args" == *"/bun server.ts"* ]]; then
+    return 0
+  fi
+
   return 1
 }
 
